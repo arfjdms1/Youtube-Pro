@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robust YouTube Player</title>
+    <style>
+        :root {
+            --primary: #ff0000;
+            --primary-dark: #cc0000;
+            --dark: #0f0f0f;
+            --dark-light: #272727;
+            --text: #f1f1f1;
+            --text-secondary: #aaa;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background-color: var(--dark);
+            color: var(--text);
+            font-family: 'Roboto', 'Arial', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container { max-width: 1200px; width: 100%; padding: 20px; }
+        .player-container {
+            position: relative;
+            background: #000;
+            display: none;
+        }
+        #video-player {
+            width: 100%;
+            display: block;
+            max-height: 80vh;
+        }
+        .player-container:fullscreen #video-player {
+            height: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+        .controls {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            opacity: 0;
+            transition: opacity 0.3s ease-in-out;
+        }
+        .controls.visible {
+            opacity: 1;
+        }
+        .progress-container { flex-grow: 1; height: 5px; background: rgba(255, 255, 255, 0.3); margin: 0 10px; cursor: pointer; }
+        .progress-bar { height: 100%; background: var(--primary); width: 0%; }
+        .time { font-size: 14px; min-width: 45px; text-align: center; }
+        .control-btn { background: none; border: none; color: var(--text); font-size: 20px; cursor: pointer; padding: 5px;}
+        #quality-selector {
+            background: none;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 4px;
+            padding: 4px;
+            font-size: 14px;
+            margin-left: 10px;
+            cursor: pointer;
+        }
+        #quality-selector option {
+            background: var(--dark-light);
+            color: white;
+        }
+        .loading {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        }
+        .spinner { width: 50px; height: 50px; border: 4px solid rgba(255, 255, 255, 0.2); border-radius: 50%; border-top-color: var(--primary); animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .video-search { text-align: center; padding: 20px; background: var(--dark-light); border-radius: 8px; }
+        .video-search h3 { margin-bottom: 15px; }
+        .video-search input { padding: 10px; width: 100%; max-width: 500px; background: #333; border: 1px solid #444; color: white; border-radius: 4px; margin-right: 10px; }
+        .video-search button { padding: 10px 20px; background: var(--primary); color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .video-search button:hover { background: var(--primary-dark); }
+        .video-title { margin-top: 20px; text-align: center; font-size: 24px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="video-search" id="video-search">
+            <h3>Enter YouTube Video URL or ID</h3>
+            <form onsubmit="handleVideoSubmit(event); return false;">
+                <input type="text" id="video-input" placeholder="e.g., dQw4w9WgXcQ" required>
+                <button type="submit">Play Video</button>
+            </form>
+        </div>
+        <h1 class="video-title" id="video-title" style="display: none;"></h1>
+        <div class="player-container" id="player-container">
+            <div class="loading" id="loading" style="display: none;">
+                <div class="spinner"></div>
+            </div>
+            <video id="video-player"></video>
+            <div class="controls" id="controls">
+                <button class="control-btn" id="play-pause">▶</button>
+                <div class="time" id="current-time">0:00</div>
+                <div class="progress-container" id="progress-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+                <div class="time" id="duration">0:00</div>
+                <select id="quality-selector" style="display: none;"></select>
+                <button class="control-btn" id="fullscreen">⛶</button>
+            </div>
+        </div>
+    </div>
+    <script>
+        let streamAbortController;
+        let controlsTimeout;
+        const playerContainer = document.getElementById('player-container');
+        const videoPlayer = document.getElementById('video-player');
+        const playPauseBtn = document.getElementById('play-pause');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const currentTimeEl = document.getElementById('current-time');
+        const durationEl = document.getElementById('duration');
+        const loadingScreen = document.getElementById('loading');
+        const videoTitleEl = document.getElementById('video-title');
+        const searchContainer = document.getElementById('video-search');
+        const fullscreenBtn = document.getElementById('fullscreen');
+        const controls = document.getElementById('controls');
+        const qualitySelector = document.getElementById('quality-selector');
+        let currentStreamData;
+        let mediaSource;
+        let videoSourceBuffer;
+        let audioSourceBuffer;
+        let bufferManagementInterval;
+
+        // Get video_id from query parameters
+        const urlParams = new URLSearchParams(window.location.search);
+        let videoId = urlParams.get('v');
+
+        function formatTime(time) {
+            if (isNaN(time)) return "0:00";
+            const minutes = Math.floor(time / 60);
+            const seconds = Math.floor(time % 60).toString().padStart(2, '0');
+            return `${minutes}:${seconds}`;
+        }
+
+        async function handleVideoSubmit(event) {
+            event.preventDefault();
+            const input = document.getElementById('video-input').value.trim();
+            let newVideoId = input;
+            try {
+                if (input.includes('youtube.com') || input.includes('youtu.be')) {
+                    const url = new URL(input);
+                    newVideoId = url.searchParams.get('v') || url.pathname.slice(1);
+                    // Handle youtu.be links
+                    if (url.hostname === 'youtu.be') {
+                        newVideoId = url.pathname.slice(1);
+                    }
+                }
+            } catch (e) {
+                console.error('Error parsing URL:', e);
+            }
+            if (newVideoId) {
+                window.history.pushState({}, '', `?v=${newVideoId}`);
+                videoId = newVideoId;
+                await initializePlayer();
+            } else {
+                alert('Please enter a valid YouTube URL or Video ID.');
+            }
+        }
+
+        async function initializePlayer() {
+            if (!videoId) return;
+            if (streamAbortController) streamAbortController.abort();
+            streamAbortController = new AbortController();
+            if (bufferManagementInterval) clearInterval(bufferManagementInterval);
+            loadingScreen.style.display = 'flex';
+            playerContainer.style.display = 'block';
+            videoTitleEl.style.display = 'block';
+            searchContainer.style.display = 'none';
+            qualitySelector.innerHTML = '';
+            qualitySelector.style.display = 'none';
+            try {
+                const signal = streamAbortController.signal;
+                // Add trailing slash for Django URL pattern
+                const response = await fetch(`/stream/${videoId}/`, { signal });
+                if (!response.ok) throw new Error(`Server error: ${response.statusText}`);
+                currentStreamData = await response.json();
+                if (currentStreamData.error) throw new Error(currentStreamData.error);
+                if (signal.aborted) return;
+                videoTitleEl.textContent = currentStreamData.title;
+                durationEl.textContent = formatTime(currentStreamData.duration);
+                currentStreamData.qualities.forEach((quality, index) => {
+                    const option = document.createElement('option');
+                    option.value = index;
+                    option.textContent = quality.label;
+                    qualitySelector.appendChild(option);
+                });
+                qualitySelector.style.display = 'block';
+                await startPlaybackForQuality(0);
+            } catch(error) {
+                if (error.name !== 'AbortError') {
+                    console.error('Error initializing player:', error);
+                    alert(`Failed to initialize player: ${error.message}`);
+                }
+            }
+        }
+
+        async function startPlaybackForQuality(qualityIndex, resumeTime = 0, wasPaused = true) {
+            if (!currentStreamData) return;
+            loadingScreen.style.display = 'flex';
+            if (streamAbortController) streamAbortController.abort();
+            streamAbortController = new AbortController();
+            if (videoPlayer.src) URL.revokeObjectURL(videoPlayer.src);
+            mediaSource = new MediaSource();
+            videoPlayer.src = URL.createObjectURL(mediaSource);
+            const selectedQuality = currentStreamData.qualities[qualityIndex];
+            mediaSource.addEventListener('sourceopen', async () => {
+                const signal = streamAbortController.signal;
+                try {
+                    let activeStreams = 0;
+                    const onStreamDone = () => {
+                        activeStreams--;
+                        if (activeStreams === 0 && mediaSource.readyState === 'open') {
+                            mediaSource.endOfStream();
+                        }
+                    };
+                    const startStream = async (url, mimeType, isVideo) => {
+                        activeStreams++;
+                        const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+                        if (isVideo) videoSourceBuffer = sourceBuffer;
+                        else audioSourceBuffer = sourceBuffer;
+                        // Add trailing slash for Django URL pattern
+                        const proxyUrl = `/proxy/${encodeURIComponent(url)}/`;
+                        const streamResponse = await fetch(proxyUrl, { signal });
+                        const reader = streamResponse.body.getReader();
+                        const pump = async () => {
+                            if (signal.aborted) return;
+                            try {
+                                const { done, value } = await reader.read();
+                                if (done) {
+                                    sourceBuffer.removeEventListener('updateend', pump);
+                                    onStreamDone();
+                                    return;
+                                }
+                                sourceBuffer.appendBuffer(value);
+                            } catch (error) {
+                                if (error.name !== 'AbortError') console.error("Pump error:", error);
+                            }
+                        };
+                        sourceBuffer.addEventListener('updateend', pump);
+                        pump();
+                    };
+                    startStream(selectedQuality.url, selectedQuality.mime_type, true);
+                    startStream(currentStreamData.audio_url, currentStreamData.audio_mime_type, false);
+                    if (bufferManagementInterval) clearInterval(bufferManagementInterval);
+                    bufferManagementInterval = setInterval(manageBuffer, 5000);
+                    if (resumeTime > 0) {
+                        const seekAndPlay = () => {
+                            videoPlayer.currentTime = resumeTime;
+                            if (!wasPaused) videoPlayer.play();
+                            videoPlayer.removeEventListener('canplay', seekAndPlay);
+                        };
+                        videoPlayer.addEventListener('canplay', seekAndPlay);
+                    }
+                } catch (error) {
+                    if (error.name !== 'AbortError') {
+                        console.error('Error setting up source buffers:', error);
+                    }
+                }
+            });
+        }
+
+        function manageBuffer() {
+            const bufferToKeep = 30;
+            const currentTime = videoPlayer.currentTime;
+            const cleanBuffer = (buffer) => {
+                if (buffer && buffer.buffered.length > 0 && !buffer.updating) {
+                    const clearUpto = currentTime - bufferToKeep;
+                    if (clearUpto > 0 && buffer.buffered.start(0) < clearUpto) {
+                        try {
+                            buffer.remove(0, clearUpto);
+                        } catch (error) {
+                            console.error("Error removing from buffer:", error);
+                        }
+                    }
+                }
+            };
+            cleanBuffer(videoSourceBuffer);
+            cleanBuffer(audioSourceBuffer);
+        }
+
+        playPauseBtn.addEventListener('click', () => {
+            if (videoPlayer.paused) videoPlayer.play();
+            else videoPlayer.pause();
+        });
+
+        videoPlayer.addEventListener('play', () => playPauseBtn.textContent = '❚❚');
+        videoPlayer.addEventListener('pause', () => playPauseBtn.textContent = '▶');
+
+        videoPlayer.addEventListener('timeupdate', () => {
+            if (videoPlayer.duration) {
+                progressBar.style.width = `${(videoPlayer.currentTime / videoPlayer.duration) * 100}%`;
+                currentTimeEl.textContent = formatTime(videoPlayer.currentTime);
+            }
+        });
+
+        progressContainer.addEventListener('click', (e) => {
+            if (videoPlayer.duration) {
+                const rect = progressContainer.getBoundingClientRect();
+                videoPlayer.currentTime = ((e.clientX - rect.left) / rect.width) * videoPlayer.duration;
+            }
+        });
+
+        videoPlayer.addEventListener('canplay', () => loadingScreen.style.display = 'none');
+        videoPlayer.addEventListener('waiting', () => loadingScreen.style.display = 'flex');
+
+        fullscreenBtn.addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                playerContainer.requestFullscreen().catch(err => {
+                    alert(`Could not enter fullscreen mode: ${err.message}`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        });
+
+        qualitySelector.addEventListener('change', () => {
+            const selectedIndex = qualitySelector.value;
+            const currentTime = videoPlayer.currentTime;
+            const isPaused = videoPlayer.paused;
+            startPlaybackForQuality(selectedIndex, currentTime, isPaused);
+        });
+
+        playerContainer.addEventListener('mousemove', () => {
+            controls.classList.add('visible');
+            playerContainer.style.cursor = 'auto';
+            clearTimeout(controlsTimeout);
+            controlsTimeout = setTimeout(() => {
+                controls.classList.remove('visible');
+                playerContainer.style.cursor = 'none';
+            }, 3000);
+        });
+
+        playerContainer.addEventListener('mouseleave', () => {
+            clearTimeout(controlsTimeout);
+            controls.classList.remove('visible');
+            playerContainer.style.cursor = 'auto';
+        });
+
+        // Initialize player if videoId is present on page load
+        if (videoId) {
+            initializePlayer();
+        }
+    </script>
+</body>
+</html>
